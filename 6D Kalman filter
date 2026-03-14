@@ -1,0 +1,594 @@
+import cv2
+import numpy as np
+import time
+from itertools import count
+
+# #########################################
+# CONFIG
+# #########################################
+CAMERA_INDEX = 0
+
+# ## Detector weights (must sum to 1.0) ###
+WEIGHT_COLOR    = 0.40
+WEIGHT_SHAPE    = 0.35
+WEIGHT_MOTION   = 0.25
+FUSION_THRESHOLD = 0.35   # minimum fused confidence to emit a detection
+
+# ## Color detector (volleyball: white/yellow) #
+# Yellow ball HSV ranges
+LOWER_YELLOW_1 = np.array([18,  80, 120])
+UPPER_YELLOW_1 = np.array([35, 255, 255])
+# White ball HSV ranges (high value, low saturation)
+LOWER_WHITE    = np.array([0,   0, 190])
+UPPER_WHITE    = np.array([180, 55, 255])
+
+# ## Shape detector #########################
+MIN_RADIUS_PX  =  8     # ignore tiny blobs
+MAX_RADIUS_PX  = 80     # ignore huge regions
+CIRCULARITY_THRESH = 0.65  # 4π·area / perimeter²  (perfect circle = 1.0)
+
+# ## Motion detector ########################
+MOG2_HISTORY   = 120
+MOG2_THRESHOLD = 18
+MORPH_KERNEL   = np.ones((5, 5), np.uint8)
+
+# ## Tracking ###############################
+MAX_ASSOCIATION_DIST = 130   # px – max cost for greedy match
+MAX_MISSED_FRAMES    = 30
+MIN_CONFIRM_HITS     = 3
+TRAJECTORY_LENGTH    = 50
+
+# ## Kalman noise ###########################
+PROCESS_NOISE      = 0.4
+MEASUREMENT_NOISE  = 6.0
+
+# ## Z-depth (single-camera pinhole) ########
+VOLLEYBALL_REAL_RADIUS_M = 0.105    # standard ball: 21 cm diameter
+FOCAL_LENGTH_PX          = 700.0    # tune to your camera (pixels)
+# Z = FOCAL_LENGTH_PX * VOLLEYBALL_REAL_RADIUS_M / radius_pixels
+
+# ## Occlusion handling #####################
+OCCLUSION_COAST_FRAMES  = 20   # trust prediction for this many frames
+OCCLUSION_VELOCITY_DIST = 60   # px – minimum predicted separation for re-ID
+
+# #########################################
+# GLOBALS
+# #########################################
+track_id_gen = count()
+
+
+# #########################################
+# KALMAN FILTER (6-D: x y vx vy ax ay)
+# #########################################
+class KalmanFilter6D:
+    """State: [x, y, vx, vy, ax, ay]"""
+
+    def __init__(self, pos):
+        self.x = np.zeros((6, 1), dtype=np.float64)
+        self.x[0:2, 0] = pos
+        self.P = np.eye(6, dtype=np.float64) * 400.0
+        self.Q = np.eye(6, dtype=np.float64) * PROCESS_NOISE
+        self.R = np.eye(2, dtype=np.float64) * MEASUREMENT_NOISE
+        # Observation matrix: only measure x, y
+        self.H = np.zeros((2, 6), dtype=np.float64)
+        self.H[0, 0] = 1.0
+        self.H[1, 1] = 1.0
+
+    def predict(self, dt: float):
+        d  = dt
+        d2 = 0.5 * dt * dt
+        F = np.array([
+            [1, 0, d,  0,  d2, 0 ],
+            [0, 1, 0,  d,  0,  d2],
+            [0, 0, 1,  0,  d,  0 ],
+            [0, 0, 0,  1,  0,  d ],
+            [0, 0, 0,  0,  1,  0 ],
+            [0, 0, 0,  0,  0,  1 ],
+        ], dtype=np.float64)
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, z: np.ndarray):
+        z = z.reshape(2, 1)
+        y = z - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x += K @ y
+        self.P = (np.eye(6) - K @ self.H) @ self.P
+
+    @property
+    def position(self): return self.x[0, 0], self.x[1, 0]
+
+    @property
+    def velocity(self): return self.x[2, 0], self.x[3, 0]
+
+    @property
+    def acceleration(self): return self.x[4, 0], self.x[5, 0]
+
+
+# #########################################
+# TRACK
+# #########################################
+class Track:
+    def __init__(self, pos, radius=20.0):
+        self.id        = next(track_id_gen)
+        self.kf        = KalmanFilter6D(pos)
+        self.missed    = 0
+        self.hits      = 1
+        self.confirmed = False
+        self.history   = []         # (x, y) positions
+        self.radius_history = [radius]
+        self.occluded  = False
+        self.occlusion_frames = 0
+
+    def predict(self, dt: float):
+        self.kf.predict(dt)
+        px, py = self.kf.position
+        self.history.append((px, py))
+        self.history = self.history[-TRAJECTORY_LENGTH:]
+
+    def update(self, z: np.ndarray, radius: float = 20.0):
+        self.kf.update(z)
+        self.missed  = 0
+        self.hits   += 1
+        self.occluded = False
+        self.occlusion_frames = 0
+        if self.hits >= MIN_CONFIRM_HITS:
+            self.confirmed = True
+        self.radius_history.append(radius)
+        if len(self.radius_history) > 10:
+            self.radius_history.pop(0)
+
+    @property
+    def avg_radius(self):
+        return float(np.mean(self.radius_history)) if self.radius_history else 20.0
+
+    def estimated_z(self) -> float | None:
+        """Estimate depth in metres using pinhole camera model."""
+        r = self.avg_radius
+        if r < 1.0:
+            return None
+        return (FOCAL_LENGTH_PX * VOLLEYBALL_REAL_RADIUS_M) / r
+
+    @property
+    def speed_px(self) -> float:
+        vx, vy = self.kf.velocity
+        return float(np.hypot(vx, vy))
+
+
+# #########################################
+# DETECTOR 1 – COLOR
+# #########################################
+def detect_color(frame: np.ndarray) -> tuple[list, np.ndarray]:
+    """
+    Returns: list of (cx, cy, radius, confidence), debug mask
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Volleyball yellow
+    mask_y = cv2.inRange(hsv, LOWER_YELLOW_1, UPPER_YELLOW_1)
+    # Volleyball white
+    mask_w = cv2.inRange(hsv, LOWER_WHITE, UPPER_WHITE)
+    mask   = cv2.bitwise_or(mask_y, mask_w)
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  MORPH_KERNEL, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    detections  = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 100:
+            continue
+        (cx, cy), r = cv2.minEnclosingCircle(cnt)
+        if not (MIN_RADIUS_PX <= r <= MAX_RADIUS_PX):
+            continue
+        # Confidence: ratio of mask pixels inside enclosing circle
+        circle_area = np.pi * r * r
+        conf = min(area / circle_area, 1.0)
+        detections.append((float(cx), float(cy), float(r), float(conf)))
+
+    return detections, mask
+
+
+# #########################################
+# DETECTOR 2 – SHAPE (Hough circles)
+# #########################################
+def detect_shape(frame: np.ndarray) -> tuple[list, np.ndarray]:
+    """
+    Returns: list of (cx, cy, radius, confidence), debug viz
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=30,
+        param1=60,
+        param2=28,
+        minRadius=int(MIN_RADIUS_PX),
+        maxRadius=int(MAX_RADIUS_PX),
+    )
+
+    detections = []
+    viz = np.zeros_like(gray)
+
+    if circles is not None:
+        circles = np.round(circles[0, :]).astype(int)
+        for (cx, cy, r) in circles:
+            # Validate circularity of the region using contour analysis
+            mask = np.zeros_like(gray)
+            cv2.circle(mask, (cx, cy), r, 255, -1)
+            region = cv2.bitwise_and(gray, gray, mask=mask)
+            _, thresh = cv2.threshold(region, 60, 255, cv2.THRESH_BINARY)
+            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                largest = max(cnts, key=cv2.contourArea)
+                area = cv2.contourArea(largest)
+                peri = cv2.arcLength(largest, True)
+                circ = (4 * np.pi * area / (peri * peri + 1e-6))
+            else:
+                circ = 0.4
+            if circ < CIRCULARITY_THRESH:
+                continue
+            conf = circ  # circularity as confidence proxy
+            detections.append((float(cx), float(cy), float(r), float(conf)))
+            cv2.circle(viz, (cx, cy), r, 255, 2)
+
+    return detections, viz
+
+
+# #########################################
+# DETECTOR 3 – MOTION (MOG2 background sub)
+# #########################################
+_mog2 = cv2.createBackgroundSubtractorMOG2(
+    history=MOG2_HISTORY,
+    varThreshold=MOG2_THRESHOLD,
+    detectShadows=False,
+)
+
+
+def detect_motion(frame: np.ndarray) -> tuple[list, np.ndarray]:
+    """
+    Returns: list of (cx, cy, radius, confidence), foreground mask
+    """
+    fg = _mog2.apply(frame)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  MORPH_KERNEL, iterations=1)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, MORPH_KERNEL, iterations=2)
+
+    contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    detections  = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 150:
+            continue
+        (cx, cy), r = cv2.minEnclosingCircle(cnt)
+        if not (MIN_RADIUS_PX <= r <= MAX_RADIUS_PX):
+            continue
+        # Confidence: ratio of foreground pixels to enclosing circle area
+        circle_area = np.pi * r * r
+        conf = min(area / circle_area, 1.0) * 0.85  # motion slightly less trusted
+        detections.append((float(cx), float(cy), float(r), float(conf)))
+
+    return detections, fg
+
+
+# #########################################
+# DETECTOR FUSION
+# Merge detections across all detectors
+# #########################################
+def fuse_detections(
+    color_dets: list,
+    shape_dets: list,
+    motion_dets: list,
+    merge_dist: float = 40.0,
+) -> list[tuple[float, float, float, float]]:
+    """
+    Merge detections from all detectors into unified list.
+    Returns: [(cx, cy, radius, fused_confidence), ...]
+    Each detector's candidates are spatially clustered.
+    Overlapping candidates from different detectors boost confidence.
+    """
+    # Tag each detection with its source weight
+    candidates = []
+    for cx, cy, r, conf in color_dets:
+        candidates.append([cx, cy, r, conf * WEIGHT_COLOR, 1, 0, 0])
+    for cx, cy, r, conf in shape_dets:
+        candidates.append([cx, cy, r, conf * WEIGHT_SHAPE, 0, 1, 0])
+    for cx, cy, r, conf in motion_dets:
+        candidates.append([cx, cy, r, conf * WEIGHT_MOTION, 0, 0, 1])
+
+    if not candidates:
+        return []
+
+    # Cluster nearby candidates
+    used   = [False] * len(candidates)
+    merged = []
+
+    for i, c in enumerate(candidates):
+        if used[i]:
+            continue
+        cluster = [c]
+        used[i] = True
+        for j, d in enumerate(candidates):
+            if used[j]:
+                continue
+            if np.hypot(c[0] - d[0], c[1] - d[1]) < merge_dist:
+                cluster.append(d)
+                used[j] = True
+
+        # Weighted average of position and radius
+        total_w = sum(x[3] for x in cluster)
+        if total_w < 1e-9:
+            continue
+        cx = sum(x[0] * x[3] for x in cluster) / total_w
+        cy = sum(x[1] * x[3] for x in cluster) / total_w
+        r  = sum(x[2] * x[3] for x in cluster) / total_w
+
+        # Fused confidence = sum of individual confidences (capped at 1.0)
+        fused_conf = min(sum(x[3] for x in cluster), 1.0)
+
+        # Bonus for multi-detector agreement
+        has_color  = any(x[4] for x in cluster)
+        has_shape  = any(x[5] for x in cluster)
+        has_motion = any(x[6] for x in cluster)
+        n_agree = sum([has_color, has_shape, has_motion])
+        if n_agree >= 2:
+            fused_conf = min(fused_conf * (1.0 + 0.15 * (n_agree - 1)), 1.0)
+
+        if fused_conf >= FUSION_THRESHOLD:
+            merged.append((cx, cy, r, fused_conf))
+
+    return merged
+
+
+# #########################################
+# DATA ASSOCIATION
+# #########################################
+def associate_tracks(
+    tracks: list[Track],
+    detections: list,
+    dt: float,
+) -> tuple[list, set, set]:
+    """
+    Greedy nearest-neighbour match using Kalman-predicted positions.
+    Returns: matches[(ti, di)], unmatched_tracks, unmatched_detections
+    """
+    matches            = []
+    unmatched_tracks   = set(range(len(tracks)))
+    unmatched_dets     = set(range(len(detections)))
+
+    if not tracks or not detections:
+        return matches, unmatched_tracks, unmatched_dets
+
+    cost = np.full((len(tracks), len(detections)), np.inf, dtype=np.float32)
+
+    for i, t in enumerate(tracks):
+        px, py  = t.kf.position
+        vx, vy  = t.kf.velocity
+        # Predict ahead by dt for better association
+        pred_x  = px + vx * dt
+        pred_y  = py + vy * dt
+
+        for j, (cx, cy, r, conf) in enumerate(detections):
+            dist = np.hypot(pred_x - cx, pred_y - cy)
+            # Penalise low-confidence detections slightly
+            cost[i, j] = dist / (conf + 0.1)
+
+    while True:
+        if not np.isfinite(cost).any():
+            break
+        i, j = np.unravel_index(np.argmin(cost), cost.shape)
+        if cost[i, j] > MAX_ASSOCIATION_DIST:
+            break
+        matches.append((i, j))
+        unmatched_tracks.discard(i)
+        unmatched_dets.discard(j)
+        cost[i, :] = np.inf
+        cost[:, j] = np.inf
+
+    return matches, unmatched_tracks, unmatched_dets
+
+
+# #########################################
+# OCCLUSION RESOLVER
+# When two confirmed tracks are very close (overlapping),
+# mark them occluded and coast on predictions.
+# When they diverge (velocity directions separate), re-associate.
+# #########################################
+def handle_occlusions(tracks: list[Track]):
+    confirmed = [t for t in tracks if t.confirmed]
+
+    for i in range(len(confirmed)):
+        for j in range(i + 1, len(confirmed)):
+            ta, tb = confirmed[i], confirmed[j]
+            ax, ay = ta.kf.position
+            bx, by = tb.kf.position
+            dist   = np.hypot(ax - bx, ay - by)
+
+            overlap_threshold = ta.avg_radius + tb.avg_radius + 20.0
+
+            if dist < overlap_threshold:
+                # Entering occlusion
+                ta.occluded = True
+                tb.occluded = True
+                ta.occlusion_frames += 1
+                tb.occlusion_frames += 1
+            else:
+                # Potentially separating — check velocity divergence
+                vax, vay = ta.kf.velocity
+                vbx, vby = tb.kf.velocity
+                vel_dist  = np.hypot(vax - vbx, vay - vby)
+                if vel_dist > OCCLUSION_VELOCITY_DIST:
+                    # Velocities are sufficiently diverged — safe to re-track
+                    ta.occluded = False
+                    tb.occluded = False
+
+
+# #########################################
+# DRAWING HELPERS
+# #########################################
+COLORS = [
+    (0, 255, 120),   # green
+    (0, 180, 255),   # cyan
+    (255, 150, 0),   # orange
+    (200, 0, 255),   # purple
+    (255, 50, 100),  # pink
+]
+
+
+def track_color(track_id: int) -> tuple:
+    return COLORS[track_id % len(COLORS)]
+
+
+def draw_tracks(frame: np.ndarray, tracks: list[Track]):
+    for t in tracks:
+        if not t.confirmed:
+            continue
+
+        col = track_color(t.id)
+        x, y = [int(v) for v in t.kf.position]
+        r    = int(t.avg_radius)
+        vx, vy = t.kf.velocity
+
+        if t.occluded:
+            # Dashed predicted circle (draw 8 arcs)
+            for angle in range(0, 360, 45):
+                a1 = angle - 15
+                a2 = angle + 15
+                cv2.ellipse(frame, (x, y), (r, r), 0, a1, a2, col, 2)
+            label_extra = " [OCC]"
+        else:
+            cv2.circle(frame, (x, y), r, col, 2)
+            label_extra = ""
+
+        # Velocity arrow (scaled)
+        spd    = np.hypot(vx, vy)
+        if spd > 2:
+            scale = min(spd * 0.4, 60)
+            ex    = int(x + vx / spd * scale)
+            ey    = int(y + vy / spd * scale)
+            cv2.arrowedLine(frame, (x, y), (ex, ey), col, 2, tipLength=0.35)
+
+        # Z-depth label
+        z = t.estimated_z()
+        z_str = f"  Z~{z:.2f}m" if z else ""
+
+        label = f"ID{t.id}{label_extra}  spd:{spd:.0f}px/s{z_str}"
+        cv2.putText(frame, label, (x - r, y - r - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+
+        # Trajectory
+        if len(t.history) > 1:
+            pts = [(int(p[0]), int(p[1])) for p in t.history]
+            for i in range(1, len(pts)):
+                alpha = i / len(pts)
+                fade  = tuple(int(c * alpha) for c in col)
+                cv2.line(frame, pts[i - 1], pts[i], fade, 2)
+
+
+def draw_hud(frame: np.ndarray, n_tracks: int, fps: float, fused_dets: int):
+    h, w = frame.shape[:2]
+    cv2.rectangle(frame, (0, 0), (280, 72), (0, 0, 0), -1)
+    cv2.putText(frame, f"FPS: {fps:.1f}", (10, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(frame, f"Tracks: {n_tracks}  Dets: {fused_dets}", (10, 44),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(frame, "Q to quit", (10, 66),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 120), 1)
+
+
+# #########################################
+# MAIN LOOP
+# #########################################
+def main():
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera index {CAMERA_INDEX}")
+
+    tracks    = []
+    last_time = time.time()
+    fps_avg   = 30.0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Frame read failed — check camera connection.")
+            break
+
+        now      = time.time()
+        dt       = max(now - last_time, 1e-3)
+        fps_avg  = 0.9 * fps_avg + 0.1 * (1.0 / dt)
+        last_time = now
+
+        # ## Run all three detectors in parallel (sequential here) ##
+        color_dets,  mask_color  = detect_color(frame)
+        shape_dets,  mask_shape  = detect_shape(frame)
+        motion_dets, mask_motion = detect_motion(frame)
+
+        # ## Fuse detections ########################################
+        fused = fuse_detections(color_dets, shape_dets, motion_dets)
+
+        # ## Predict all tracks #####################################
+        for t in tracks:
+            t.predict(dt)
+
+        # ## Associate ##############################################
+        matches, unmatched_tracks, unmatched_dets = associate_tracks(tracks, fused, dt)
+
+        # ## Update matched tracks ##################################
+        for ti, di in matches:
+            cx, cy, r, _ = fused[di]
+            tracks[ti].update(np.array([cx, cy]), radius=r)
+
+        # ## Age unmatched tracks ###################################
+        for ti in unmatched_tracks:
+            t = tracks[ti]
+            t.missed += 1
+            # If coasting during occlusion, trust the Kalman prediction
+            if t.occluded and t.occlusion_frames < OCCLUSION_COAST_FRAMES:
+                t.occlusion_frames += 1
+                # Do NOT increment missed — we trust the prediction
+                t.missed = max(t.missed - 1, 0)
+
+        # ## Spawn new tracks #######################################
+        for di in unmatched_dets:
+            cx, cy, r, conf = fused[di]
+            tracks.append(Track(np.array([cx, cy]), radius=r))
+
+        # ## Handle occlusions ######################################
+        handle_occlusions(tracks)
+
+        # ## Prune dead tracks ######################################
+        tracks = [t for t in tracks if t.missed < MAX_MISSED_FRAMES]
+
+        # ## Draw ###################################################
+        draw_tracks(frame, tracks)
+        confirmed_count = sum(1 for t in tracks if t.confirmed)
+        draw_hud(frame, confirmed_count, fps_avg, len(fused))
+
+        # ## Show windows ###########################################
+        cv2.imshow("Volleyball Tracker", frame)
+
+        # Debug windows (colour-mapped for visibility)
+        debug_color  = cv2.cvtColor(mask_color,  cv2.COLOR_GRAY2BGR)
+        debug_motion = cv2.cvtColor(mask_motion, cv2.COLOR_GRAY2BGR)
+        # Overlay fused detection circles
+        for cx, cy, r, conf in fused:
+            cv2.circle(frame, (int(cx), int(cy)), int(r), (0, 255, 255), 1)
+        cv2.imshow("Color mask",  debug_color)
+        cv2.imshow("Motion mask", debug_motion)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
